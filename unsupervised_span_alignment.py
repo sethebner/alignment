@@ -9,14 +9,14 @@ from allennlp.modules.span_extractors import SelfAttentiveSpanExtractor, Endpoin
 
 from sacremoses import MosesTokenizer
 
-MAX_SPAN_WIDTH = None
-
 def parse_args():
 	parser = argparse.ArgumentParser()
 	parser.add_argument('--input', type=str, required=True, help='file with input data')
 	parser.add_argument('--output', type=str, help='file to write outputs')
 	parser.add_argument('--source-lang', type=str, required=True, help='language of source text')
 	parser.add_argument('--target-lang', type=str, required=True, help='language of target text')
+	parser.add_argument('--max-source-span-width', type=int, default=None, help='maximum length of a source text span')
+	parser.add_argument('--max-target-span-width', type=int, default=None, help='maximum length of a target text span')
 	parser.add_argument('--verbose', action='store_true', help='enable verbose logging')
 
 	args = parser.parse_args()
@@ -50,7 +50,13 @@ def overlaps(i, j, spans):
 
 	return sum(used_positions[i-minval: j-minval+1]) > 0
 
-def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", verbose=False):
+def mean_pool(subtoken_embeddings, subtoken_span_boundaries):
+	raise NotImplementedError
+
+def max_pool():
+	raise NotImplementedError
+
+def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, verbose=False):
 	if verbose:
 		print(source_tokens)
 		print(target_tokens)
@@ -87,9 +93,9 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source
 
 
 	if not source_span_boundaries:
-		source_span_boundaries = enumerate_spans(source_tokens, max_span_width=MAX_SPAN_WIDTH)
+		source_span_boundaries = enumerate_spans(source_tokens, max_span_width=max_source_span_width)
 	if not target_span_boundaries:
-		target_span_boundaries = enumerate_spans(target_tokens, max_span_width=MAX_SPAN_WIDTH)
+		target_span_boundaries = enumerate_spans(target_tokens, max_span_width=max_target_span_width)
 
 	source_subtoken_span_boundaries = []
 	for span_boundary in source_span_boundaries:
@@ -118,9 +124,12 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source
 		if type(span_extractor) == SelfAttentiveSpanExtractor:
 			source_span_embeddings = span_extractor._embed_spans(source_subtoken_embeddings, torch.tensor(source_subtoken_span_boundaries))[0]
 			target_span_embeddings = span_extractor._embed_spans(target_subtoken_embeddings, torch.tensor(target_subtoken_span_boundaries))[0]
-		else:
+		elif type(span_extractor) in [EndpointSpanExtractor, BidirectionalEndpointSpanExtractor]:
 			source_span_embeddings = span_extractor._embed_spans(source_subtoken_embeddings, torch.tensor(source_subtoken_span_boundaries).unsqueeze(0))[0]
 			target_span_embeddings = span_extractor._embed_spans(target_subtoken_embeddings, torch.tensor(target_subtoken_span_boundaries).unsqueeze(0))[0]
+		else:
+			source_span_embeddings = span_extractor(source_subtoken_embeddings, torch.tensor(source_subtoken_span_boundaries))
+			target_span_embeddings = span_extractor(target_subtoken_embeddings, torch.tensor(target_subtoken_span_boundaries))
 
 		for i in range(num_source_spans):
 			for j in range(num_target_spans):
@@ -138,8 +147,7 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source
 		if not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans):
 			source_span_tokens = source_tokens[source_span[0]:source_span[1]+1]
 			target_span_tokens = target_tokens[target_span[0]:target_span[1]+1]
-			# source_span_subtokens = tokenizer.convert_ids_to_tokens(source_subtoken_ids[source_token2subtoken[source_span_boundaries[source_span_idx][0]][0] : source_token2subtoken[source_span_boundaries[source_span_idx][1]][-1] + 1])
-			# target_span_subtokens = tokenizer.convert_ids_to_tokens(target_subtoken_ids[target_token2subtoken[target_span_boundaries[target_span_idx][0]][0] : target_token2subtoken[target_span_boundaries[target_span_idx][1]][-1] + 1])
+
 			result.append({"source_span": source_span, "target_span": target_span, "source_span_tokens": source_span_tokens, "target_span_tokens": target_span_tokens, "score": table[best_alignment]})
 
 			if verbose:
@@ -164,6 +172,9 @@ def main():
 	model = AutoModel.from_pretrained('xlm-roberta-base')
 	span_extractor = EndpointSpanExtractor(768)
 
+	# https://aclanthology.org/2020.repl4nlp-1.20/
+	# span_extractor = EndpointSpanExtractor(768, combination="x+y,y-x")  # Diff-Sum
+
 	def _tokenize(sentence, lang):
 		return MosesTokenizer(lang=lang).tokenize(sentence, escape=False)
 
@@ -186,16 +197,17 @@ def main():
 		source_span_boundaries = item.get('source_spans', None)
 		target_span_boundaries = item.get('target_spans', None)
 
-		alignment = align(source_sentence, target_sentence, tokenizer, model, span_extractor, source_span_boundaries, target_span_boundaries, verbose=args.verbose)
+		alignment = align(source_sentence, target_sentence, tokenizer, model, span_extractor, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, verbose=args.verbose)
 		if args.verbose:
 			print('='*10)
 
 		outputs.append({"source_tokens": source_sentence, "target_tokens": target_sentence, "alignment": alignment})
 
-	with open(args.output, "w") as f:
-		for output in outputs:
-			f.write(json.dumps(output, ensure_ascii=False))
-			f.write('\n')
+	if args.output:
+		with open(args.output, "w") as f:
+			for output in outputs:
+				f.write(json.dumps(output, ensure_ascii=False))
+				f.write('\n')
 
 if __name__ == "__main__":
 	main()
