@@ -50,11 +50,35 @@ def overlaps(i, j, spans):
 
 	return sum(used_positions[i-minval: j-minval+1]) > 0
 
-def mean_pool(subtoken_embeddings, subtoken_span_boundaries):
-	raise NotImplementedError
+def span_mask(subtoken_embeddings, subtoken_span_boundaries):
+	subtoken_positions = torch.arange(0,subtoken_embeddings.shape[1]).unsqueeze(-1).repeat(1,subtoken_span_boundaries.shape[0])
+	mask = (subtoken_positions.ge(subtoken_span_boundaries[:,0]) * subtoken_positions.le(subtoken_span_boundaries[:,1])).permute(1,0)
+	return mask
 
-def max_pool():
-	raise NotImplementedError
+def mean_pool(subtoken_embeddings, subtoken_span_boundaries):
+	mask = span_mask(subtoken_embeddings, subtoken_span_boundaries)
+
+	# Adapted from AllenNLP's `masked_mean()` function
+	# (https://github.com/allenai/allennlp/blob/main/allennlp/nn/util.py)
+	replaced_vector = subtoken_embeddings.masked_fill(~mask.unsqueeze(-1), 0.0)
+	value_sum = torch.sum(replaced_vector, dim=1)
+	value_count = torch.sum(mask.unsqueeze(-1), dim=1)
+	mean = value_sum / value_count.float().clamp(min=1e-13)
+
+	return mean
+
+def max_pool(subtoken_embeddings, subtoken_span_boundaries):
+	mask = span_mask(subtoken_embeddings, subtoken_span_boundaries)
+
+	# Adapted from AllenNLP's `masked_max()` function
+	# (https://github.com/allenai/allennlp/blob/main/allennlp/nn/util.py)
+	replaced_vector = subtoken_embeddings.masked_fill(~mask.unsqueeze(-1), torch.finfo(subtoken_embeddings.dtype).min)
+	max_value, _ = replaced_vector.max(dim=1)
+
+	return max_value
+
+def mean_max_pool(subtoken_embeddings, subtoken_span_boundaries):
+	return torch.cat([mean_pool(subtoken_embeddings, subtoken_span_boundaries), max_pool(subtoken_embeddings, subtoken_span_boundaries)], dim=1)
 
 def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, verbose=False):
 	if verbose:
@@ -170,7 +194,8 @@ def main():
 
 	tokenizer = AutoTokenizer.from_pretrained('xlm-roberta-base')
 	model = AutoModel.from_pretrained('xlm-roberta-base')
-	span_extractor = EndpointSpanExtractor(768)
+	span_extractor = mean_pool
+	# span_extractor = EndpointSpanExtractor(768)
 
 	# https://aclanthology.org/2020.repl4nlp-1.20/
 	# span_extractor = EndpointSpanExtractor(768, combination="x+y,y-x")  # Diff-Sum
