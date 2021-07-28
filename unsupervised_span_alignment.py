@@ -82,9 +82,10 @@ def mean_max_pool(subtoken_embeddings, subtoken_span_boundaries):
 
 def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, verbose=False):
 	if verbose:
-		print(source_tokens)
-		print(target_tokens)
-		print('-'*10)
+		print('='*20)
+		print(f"src: {source_tokens}")
+		print(f"tgt: {target_tokens}")
+		print('-'*20)
 
 	encoded_source_sentence = tokenizer(source_tokens, padding=True, truncation=True, return_tensors='pt', is_split_into_words=True)
 	encoded_target_sentence = tokenizer(target_tokens, padding=True, truncation=True, return_tensors='pt', is_split_into_words=True)
@@ -182,6 +183,10 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source
 
 		table[best_alignment] = float('-inf')  # erase so we can move on to the next best alignment
 
+	if verbose:
+		print('='*20)
+		print()
+
 	return result
 
 def main():
@@ -223,8 +228,6 @@ def main():
 		target_span_boundaries = item.get('target_spans', None)
 
 		alignment = align(source_sentence, target_sentence, tokenizer, model, span_extractor, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, verbose=args.verbose)
-		if args.verbose:
-			print('='*10)
 
 		outputs.append({"source_tokens": source_sentence, "target_tokens": target_sentence, "alignment": alignment})
 
