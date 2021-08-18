@@ -19,6 +19,7 @@ def parse_args():
 	parser.add_argument('--max-target-span-width', type=int, default=None, help='maximum length of a target text span')
 	parser.add_argument('--span-extractor', type=str, choices=['mean_pool', 'max_pool', 'mean_max_pool', 'endpoint', 'diffsum'], help='which span extractor to use')
 	parser.add_argument('--decoding-method', type=str, required=True, help='which method to use to decode alignments')
+	parser.add_argument('--allow-overlap', action='store_true', help='whether to allow spans in the alignments to overlap')
 	parser.add_argument('--verbose', action='store_true', help='enable verbose logging')
 
 	args = parser.parse_args()
@@ -82,7 +83,7 @@ def max_pool(subtoken_embeddings, subtoken_span_boundaries):
 def mean_max_pool(subtoken_embeddings, subtoken_span_boundaries):
 	return torch.cat([mean_pool(subtoken_embeddings, subtoken_span_boundaries), max_pool(subtoken_embeddings, subtoken_span_boundaries)], dim=1)
 
-def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decoding_method, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, verbose=False):
+def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decoding_method, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, allow_overlap=False, verbose=False):
 	if verbose:
 		print('='*20)
 		print(f"src: {source_tokens}")
@@ -175,7 +176,7 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decodi
 			source_span = source_span_boundaries[source_span_idx]
 			target_span = target_span_boundaries[target_span_idx]
 
-			if not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans):
+			if allow_overlap or (not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans)):
 				source_span_tokens = source_tokens[source_span[0]:source_span[1]+1]
 				target_span_tokens = target_tokens[target_span[0]:target_span[1]+1]
 
@@ -212,7 +213,7 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decodi
 			source_span = source_span_boundaries[source_span_idx]
 			target_span = target_span_boundaries[target_span_idx]
 
-			if not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans):
+			if allow_overlap or (not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans)):
 				source_span_tokens = source_tokens[source_span[0]:source_span[1]+1]
 				target_span_tokens = target_tokens[target_span[0]:target_span[1]+1]
 
@@ -251,7 +252,7 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decodi
 			source_span = source_span_boundaries[source_span_idx]
 			target_span = target_span_boundaries[target_span_idx]
 
-			if not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans):
+			if allow_overlap or (not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans)):
 				source_span_tokens = source_tokens[source_span[0]:source_span[1]+1]
 				target_span_tokens = target_tokens[target_span[0]:target_span[1]+1]
 
@@ -320,7 +321,7 @@ def main():
 		source_span_boundaries = item.get('source_spans', None)
 		target_span_boundaries = item.get('target_spans', None)
 
-		alignment = align(source_sentence, target_sentence, tokenizer, model, span_extractor, args.decoding_method, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, verbose=args.verbose)
+		alignment = align(source_sentence, target_sentence, tokenizer, model, span_extractor, args.decoding_method, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, allow_overlap=args.allow_overlap, verbose=args.verbose)
 
 		outputs.append({"source_tokens": source_sentence, "target_tokens": target_sentence, "alignment": alignment})
 
