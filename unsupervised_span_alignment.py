@@ -17,6 +17,8 @@ def parse_args():
 	parser.add_argument('--target-lang', type=str, required=True, help='language of target text')
 	parser.add_argument('--max-source-span-width', type=int, default=None, help='maximum length of a source text span')
 	parser.add_argument('--max-target-span-width', type=int, default=None, help='maximum length of a target text span')
+	parser.add_argument('--span-extractor', type=str, choices=['mean_pool', 'max_pool', 'mean_max_pool', 'endpoint', 'diffsum'], help='which span extractor to use')
+	parser.add_argument('--decoding-method', type=str, required=True, help='which method to use to decode alignments')
 	parser.add_argument('--verbose', action='store_true', help='enable verbose logging')
 
 	args = parser.parse_args()
@@ -80,7 +82,7 @@ def max_pool(subtoken_embeddings, subtoken_span_boundaries):
 def mean_max_pool(subtoken_embeddings, subtoken_span_boundaries):
 	return torch.cat([mean_pool(subtoken_embeddings, subtoken_span_boundaries), max_pool(subtoken_embeddings, subtoken_span_boundaries)], dim=1)
 
-def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, verbose=False):
+def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decoding_method, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, verbose=False):
 	if verbose:
 		print('='*20)
 		print(f"src: {source_tokens}")
@@ -160,28 +162,110 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, source
 			for j in range(num_target_spans):
 				table[i][j] = torch.nn.functional.cosine_similarity(source_span_embeddings[i], target_span_embeddings[j], dim=0)
 
-	used_source_spans = []
-	used_target_spans = []
-	result = []
-	for _ in range(table.size):
-		best_alignment = np.unravel_index(table.argmax(), table.shape)
-		source_span_idx, target_span_idx = best_alignment
-		source_span = source_span_boundaries[source_span_idx]
-		target_span = target_span_boundaries[target_span_idx]
+	# Decode alignments from table
+	if decoding_method == "greedy":
+		used_source_spans = []
+		used_target_spans = []
+		result = []
 
-		if not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans):
-			source_span_tokens = source_tokens[source_span[0]:source_span[1]+1]
-			target_span_tokens = target_tokens[target_span[0]:target_span[1]+1]
+		# Decode in descending order of score
+		for _ in range(table.size):
+			best_alignment = np.unravel_index(table.argmax(), table.shape)
+			source_span_idx, target_span_idx = best_alignment
+			source_span = source_span_boundaries[source_span_idx]
+			target_span = target_span_boundaries[target_span_idx]
 
-			result.append({"source_span": source_span, "target_span": target_span, "source_span_tokens": source_span_tokens, "target_span_tokens": target_span_tokens, "score": table[best_alignment]})
+			if not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans):
+				source_span_tokens = source_tokens[source_span[0]:source_span[1]+1]
+				target_span_tokens = target_tokens[target_span[0]:target_span[1]+1]
 
-			if verbose:
-				print(source_span_tokens, target_span_tokens, source_span, target_span, table[best_alignment])
+				result.append({"source_span": source_span, "target_span": target_span, "source_span_tokens": source_span_tokens, "target_span_tokens": target_span_tokens, "score": table[best_alignment]})
 
-			used_source_spans.append(source_span)
-			used_target_spans.append(target_span)
+				if verbose:
+					print(source_span_tokens, target_span_tokens, source_span, target_span, table[best_alignment])
 
-		table[best_alignment] = float('-inf')  # erase so we can move on to the next best alignment
+				used_source_spans.append(source_span)
+				used_target_spans.append(target_span)
+
+			table[best_alignment] = float('-inf')  # erase so we can move on to the next best alignment
+	elif decoding_method == "intersection":
+		used_source_spans = []
+		used_target_spans = []
+		result = []
+
+		best_source_span_for_target_span = np.argmax(table, axis=0)
+		best_target_span_for_source_span = np.argmax(table, axis=1)
+
+		# Convert indices into one-hot vectors
+		source_to_target_selection = np.zeros(table.shape)
+		source_to_target_selection[np.arange(best_target_span_for_source_span.size), best_target_span_for_source_span] = 1
+
+		target_to_source_selection = np.zeros(table.shape)
+		target_to_source_selection[best_source_span_for_target_span, np.arange(best_source_span_for_target_span.size)] = 1
+
+		# Choose alignments that are mutually preferred in both directions (source -> target, target -> source)
+		# This is a high precision, low recall approach that incorporates symmetrization into the decoding procedure
+		alignments = np.argwhere(source_to_target_selection * target_to_source_selection).tolist()
+		for alignment in alignments:
+			alignment = tuple(alignment)  # cast to tuple so that indexing into the table works properly
+			source_span_idx, target_span_idx = alignment
+			source_span = source_span_boundaries[source_span_idx]
+			target_span = target_span_boundaries[target_span_idx]
+
+			if not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans):
+				source_span_tokens = source_tokens[source_span[0]:source_span[1]+1]
+				target_span_tokens = target_tokens[target_span[0]:target_span[1]+1]
+
+				result.append({"source_span": source_span, "target_span": target_span, "source_span_tokens": source_span_tokens, "target_span_tokens": target_span_tokens, "score": table[alignment]})
+
+				if verbose:
+					print(source_span_tokens, target_span_tokens, source_span, target_span, table[alignment])
+
+				used_source_spans.append(source_span)
+				used_target_spans.append(target_span)
+	elif decoding_method == "weighted_intersection":
+		used_source_spans = []
+		used_target_spans = []
+		result = []
+
+		best_source_span_for_target_span = np.argmax(table, axis=0)
+		best_target_span_for_source_span = np.argmax(table, axis=1)
+
+		source_to_target_selection = np.zeros(table.shape)
+		source_to_target_selection[np.arange(best_target_span_for_source_span.size), best_target_span_for_source_span] = 1
+
+		target_to_source_selection = np.zeros(table.shape)
+		target_to_source_selection[best_source_span_for_target_span, np.arange(best_source_span_for_target_span.size)] = 1
+
+		# Mask out discarded alignments
+		table *= (source_to_target_selection * target_to_source_selection)
+
+		# The most amount of alignments to decode
+		# If we use the greedy decoding method here without a way to know when to stop, then we might end up decoding alignments we discarded previously
+		max_alignments = len(np.argwhere(table).tolist())
+
+		# Decode in descending order of score
+		for _ in range(max_alignments):
+			best_alignment = np.unravel_index(table.argmax(), table.shape)
+			source_span_idx, target_span_idx = best_alignment
+			source_span = source_span_boundaries[source_span_idx]
+			target_span = target_span_boundaries[target_span_idx]
+
+			if not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans):
+				source_span_tokens = source_tokens[source_span[0]:source_span[1]+1]
+				target_span_tokens = target_tokens[target_span[0]:target_span[1]+1]
+
+				result.append({"source_span": source_span, "target_span": target_span, "source_span_tokens": source_span_tokens, "target_span_tokens": target_span_tokens, "score": table[best_alignment]})
+
+				if verbose:
+					print(source_span_tokens, target_span_tokens, source_span, target_span, table[best_alignment])
+
+				used_source_spans.append(source_span)
+				used_target_spans.append(target_span)
+
+			table[best_alignment] = float('-inf')  # erase so we can move on to the next best alignment
+	else:
+		raise ValueError(f"unrecognized decoding method: {decoding_method}")
 
 	if verbose:
 		print('='*20)
@@ -199,11 +283,20 @@ def main():
 
 	tokenizer = AutoTokenizer.from_pretrained('xlm-roberta-base')
 	model = AutoModel.from_pretrained('xlm-roberta-base')
-	span_extractor = mean_pool
-	# span_extractor = EndpointSpanExtractor(768)
 
-	# https://aclanthology.org/2020.repl4nlp-1.20/
-	# span_extractor = EndpointSpanExtractor(768, combination="x+y,y-x")  # Diff-Sum
+	if args.span_extractor == "mean_pool":
+		span_extractor = mean_pool
+	elif args.span_extractor == "max_pool":
+		span_extractor = max_pool
+	elif args.span_extractor == "mean_max_pool":
+		span_extractor = mean_max_pool
+	elif args.span_extractor == "endpoint":
+		span_extractor = EndpointSpanExtractor(768)
+	elif args.span_extractor == "diffsum":
+		# https://aclanthology.org/2020.repl4nlp-1.20/
+		span_extractor = EndpointSpanExtractor(768, combination="x+y,y-x")
+	else:
+		raise ValueError(f"unrecognized span extractor: {args.span_extractor}")
 
 	def _tokenize(sentence, lang):
 		return MosesTokenizer(lang=lang).tokenize(sentence, escape=False)
@@ -227,7 +320,7 @@ def main():
 		source_span_boundaries = item.get('source_spans', None)
 		target_span_boundaries = item.get('target_spans', None)
 
-		alignment = align(source_sentence, target_sentence, tokenizer, model, span_extractor, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, verbose=args.verbose)
+		alignment = align(source_sentence, target_sentence, tokenizer, model, span_extractor, args.decoding_method, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, verbose=args.verbose)
 
 		outputs.append({"source_tokens": source_sentence, "target_tokens": target_sentence, "alignment": alignment})
 
