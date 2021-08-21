@@ -17,7 +17,7 @@ def parse_args():
 	parser.add_argument('--target-lang', type=str, required=True, help='language of target text')
 	parser.add_argument('--max-source-span-width', type=int, default=None, help='maximum length of a source text span')
 	parser.add_argument('--max-target-span-width', type=int, default=None, help='maximum length of a target text span')
-	parser.add_argument('--span-extractor', type=str, choices=['mean_pool', 'max_pool', 'mean_max_pool', 'endpoint', 'diffsum'], help='which span extractor to use')
+	parser.add_argument('--span-extractor', type=str, choices=['mean_pool', 'max_pool', 'mean_max_pool', 'endpoint', 'diffsum', 'coherent'], help='which span extractor to use')
 	parser.add_argument('--decoding-method', type=str, required=True, help='which method to use to decode alignments')
 	parser.add_argument('--allow-overlap', action='store_true', help='whether to allow spans in the alignments to overlap')
 	parser.add_argument('--verbose', action='store_true', help='enable verbose logging')
@@ -82,6 +82,20 @@ def max_pool(subtoken_embeddings, subtoken_span_boundaries):
 
 def mean_max_pool(subtoken_embeddings, subtoken_span_boundaries):
 	return torch.cat([mean_pool(subtoken_embeddings, subtoken_span_boundaries), max_pool(subtoken_embeddings, subtoken_span_boundaries)], dim=1)
+
+def coherent(subtoken_embeddings, subtoken_span_boundaries):
+	endpoint_representation = EndpointSpanExtractor(768)._embed_spans(subtoken_embeddings, torch.tensor(subtoken_span_boundaries).unsqueeze(0))[0]
+	# Choice of `a` and `b` dimensionalities follows from the proportions described in footnote 2 of https://aclanthology.org/2020.repl4nlp-1.20/
+	a = 360
+	b = 24
+	left_endpoint = endpoint_representation[:, :768]
+	right_endpoint = endpoint_representation[:, 768:]
+	left_endpoint_pieces = left_endpoint[:, :a], left_endpoint[:, a:a*2], left_endpoint[:, a*2:a*2 + b], left_endpoint[:, a*2 + b:]
+	right_endpoint_pieces = right_endpoint[:, :a], right_endpoint[:, a:a*2], right_endpoint[:, a*2:a*2 + b], right_endpoint[:, a*2 + b:]
+	coherence_term = torch.sum(left_endpoint_pieces[2]*right_endpoint_pieces[3], dim=1).unsqueeze(-1)
+	coherent_representation = torch.cat([left_endpoint_pieces[0], right_endpoint_pieces[1], coherence_term], dim=-1)
+
+	return coherent_representation
 
 def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decoding_method, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, allow_overlap=False, verbose=False):
 	if verbose:
@@ -296,6 +310,9 @@ def main():
 	elif args.span_extractor == "diffsum":
 		# https://aclanthology.org/2020.repl4nlp-1.20/
 		span_extractor = EndpointSpanExtractor(768, combination="x+y,y-x")
+	elif args.span_extractor == "coherent":
+		# https://aclanthology.org/P19-1436/
+		span_extractor = coherent
 	else:
 		raise ValueError(f"unrecognized span extractor: {args.span_extractor}")
 
