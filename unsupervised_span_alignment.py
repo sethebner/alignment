@@ -3,11 +3,19 @@ import json
 import numpy as np
 import torch
 
+import benepar, spacy
+from spacy.tokens import Doc
+from benepar import BeneparComponent
+
 from transformers import AutoTokenizer, AutoModel
 
 from allennlp.modules.span_extractors import SelfAttentiveSpanExtractor, EndpointSpanExtractor, BidirectionalEndpointSpanExtractor
 
 from sacremoses import MosesTokenizer
+
+SPACY_NAMES = {"en": {"spacy_model_name": 'en_core_web_md', "parser_name": 'benepar_en3'},
+			   "fr": {"spacy_model_name": 'fr_core_news_md', "parser_name": 'benepar_fr2'},
+			  }
 
 def parse_args():
 	parser = argparse.ArgumentParser()
@@ -17,8 +25,9 @@ def parse_args():
 	parser.add_argument('--target-lang', type=str, required=True, help='language of target text')
 	parser.add_argument('--max-source-span-width', type=int, default=None, help='maximum length of a source text span')
 	parser.add_argument('--max-target-span-width', type=int, default=None, help='maximum length of a target text span')
+	parser.add_argument('--span-enumeration', type=str, required=True, choices=['full', 'parse'], help='how to enumerate spans when not provided')
 	parser.add_argument('--span-extractor', type=str, choices=['mean_pool', 'max_pool', 'mean_max_pool', 'endpoint', 'diffsum', 'coherent'], help='which span extractor to use')
-	parser.add_argument('--decoding-method', type=str, required=True, help='which method to use to decode alignments')
+	parser.add_argument('--decoding-method', type=str, required=True, choices=['greedy', 'intersection', 'weighted_intersection'], help='which method to use to decode alignments')
 	parser.add_argument('--allow-overlap', action='store_true', help='whether to allow spans in the alignments to overlap')
 	parser.add_argument('--verbose', action='store_true', help='enable verbose logging')
 
@@ -84,7 +93,7 @@ def mean_max_pool(subtoken_embeddings, subtoken_span_boundaries):
 	return torch.cat([mean_pool(subtoken_embeddings, subtoken_span_boundaries), max_pool(subtoken_embeddings, subtoken_span_boundaries)], dim=1)
 
 def coherent(subtoken_embeddings, subtoken_span_boundaries):
-	endpoint_representation = EndpointSpanExtractor(768)._embed_spans(subtoken_embeddings, torch.tensor(subtoken_span_boundaries).unsqueeze(0))[0]
+	endpoint_representation = EndpointSpanExtractor(768)._embed_spans(subtoken_embeddings, torch.as_tensor(subtoken_span_boundaries).unsqueeze(0))[0]
 	# Choice of `a` and `b` dimensionalities follows from the proportions described in footnote 2 of https://aclanthology.org/2020.repl4nlp-1.20/
 	a = 360
 	b = 24
@@ -96,6 +105,14 @@ def coherent(subtoken_embeddings, subtoken_span_boundaries):
 	coherent_representation = torch.cat([left_endpoint_pieces[0], right_endpoint_pieces[1], coherence_term], dim=-1)
 
 	return coherent_representation
+
+def _custom_sentencizer(doc):
+	for i, token in enumerate(doc):
+		if i == 0:
+			doc[i].is_sent_start = True
+		else:
+			doc[i].is_sent_start = False
+	return doc
 
 def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decoding_method, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, allow_overlap=False, verbose=False):
 	if verbose:
@@ -134,10 +151,10 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decodi
 			count += 1
 
 
-	if not source_span_boundaries:
-		source_span_boundaries = enumerate_spans(source_tokens, max_span_width=max_source_span_width)
-	if not target_span_boundaries:
-		target_span_boundaries = enumerate_spans(target_tokens, max_span_width=max_target_span_width)
+	# if not source_span_boundaries:
+	# 	source_span_boundaries = enumerate_spans(source_tokens, max_span_width=max_source_span_width)
+	# if not target_span_boundaries:
+	# 	target_span_boundaries = enumerate_spans(target_tokens, max_span_width=max_target_span_width)
 
 	source_subtoken_span_boundaries = []
 	for span_boundary in source_span_boundaries:
@@ -316,27 +333,91 @@ def main():
 	else:
 		raise ValueError(f"unrecognized span extractor: {args.span_extractor}")
 
-	def _tokenize(sentence, lang):
-		return MosesTokenizer(lang=lang).tokenize(sentence, escape=False)
+	def _get_tokens_and_spans(data, lang, side, spacy_parsers=None):
+		tokens = None
+		spans = None
+		if side == "source":
+			sentence = data['source']
+			max_span_width = args.max_source_span_width
+			given_spans = data.get('source_spans', None)
+		elif side == "target":
+			sentence = data['target']
+			max_span_width = args.max_target_span_width
+			given_spans = data.get('target_spans', None)
+		else:
+			raise ValueError(f"unrecognized side: {side}")
+
+		if type(sentence) in [tuple, list]:
+			tokens = sentence
+			pretokenized = True
+		elif type(sentence) == str:
+			pretokenized = False
+		else:
+			raise TypeError(f"cannot handle text with type: {type(sentence)}")
+
+		if given_spans != None:
+			if not pretokenized:
+				raise ValueError(f"spans are provided but the text is not pretokenized")
+
+			assert tokens is not None
+
+			return tokens, given_spans
+
+		if not given_spans:
+			if args.span_enumeration == "parse":
+				if lang not in spacy_parsers.keys():
+					raise NotImplementedError(f"Parsing is not supported for {lang}")
+
+				if pretokenized:
+					nlp = spacy_parsers[lang]['pretokenized']['spacy_model']
+					ConstituencyParser = SPACY_PARSERS[lang]['pretokenized']['parser']
+					doc = Doc(nlp.vocab, words=tokens, spaces=[True]*(len(tokens)-1) + [False])
+					doc = _custom_sentencizer(doc)
+					doc = ConstituencyParser(doc)
+
+				else:
+					nlp = spacy_parsers[lang]['untokenized']['spacy_model']
+					doc = nlp(sentence)
+
+				if lang == 'en':
+					POS_TAGS = ['NP', 'VP']
+				elif lang == 'fr':
+					POS_TAGS = ['NP', 'VN']
+				else:
+					raise NotImplementedError(f"Allowable POS tags not specified for {lang}")
+
+				sent = list(doc.sents)[0]
+				spans = [(s.start, s.end-1) for s in sent._.constituents for pos in POS_TAGS if pos in s._.labels]
+				spans = [span for span in spans if (span[1] - span[0]) <= max_span_width]
+
+				return [str(token) for token in sent], spans
+			elif args.span_enumeration == "full":
+				if not pretokenized:
+					tokens = MosesTokenizer(lang=lang).tokenize(sentence, escape=False)
+
+				spans = enumerate_spans(tokens, max_span_width=max_span_width)
+				return tokens, spans
+
+	# Instantiate parsers upfront so we don't have to create a new parser for every example
+	SPACY_PARSERS = {}
+	if args.span_enumeration == "parse":
+		def _instantiate_parser(spacy_model_name, parser_model_name):
+			spacy_model = spacy.load(spacy_model_name, disable=['tagger', 'parser', 'ner'])
+			parser = BeneparComponent(parser_model_name)
+
+			_untok_spacy_model = spacy.load(spacy_model_name, disable=['ner'])
+			_untok_spacy_model.add_pipe("benepar", config={"model": parser_model_name})
+
+			return {'pretokenized': {"spacy_model": spacy_model, "parser": parser},
+					'untokenized': {"spacy_model": _untok_spacy_model}}
+
+		for lang in [args.source_lang, args.target_lang]:
+			SPACY_PARSERS[lang] = _instantiate_parser(SPACY_NAMES[lang]['spacy_model_name'], SPACY_NAMES[lang]['parser_name'])
 
 	outputs = []
 	for item in data:
-		if type(item['source']) in [tuple, list]:
-			source_sentence = item['source']
-		elif type(item['source']) == str:
-			source_sentence = _tokenize(item['source'], lang=args.source_lang)
-		else:
-			raise TypeError(f"cannot handle source text with type: {type(item['source'])}")
-
-		if type(item['target']) in [tuple, list]:
-			target_sentence = item['target']
-		elif type(item['target']) == str:
-			target_sentence = _tokenize(item['target'], lang=args.target_lang)
-		else:
-			raise TypeError(f"cannot handle target text with type: {type(item['target'])}")
-
-		source_span_boundaries = item.get('source_spans', None)
-		target_span_boundaries = item.get('target_spans', None)
+		source_sentence, source_span_boundaries = _get_tokens_and_spans(item, lang=args.source_lang, side="source", spacy_parsers=SPACY_PARSERS)
+		target_sentence, target_span_boundaries = _get_tokens_and_spans(item, lang=args.target_lang, side="target", spacy_parsers=SPACY_PARSERS)
 
 		alignment = align(source_sentence, target_sentence, tokenizer, model, span_extractor, args.decoding_method, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, allow_overlap=args.allow_overlap, verbose=args.verbose)
 
