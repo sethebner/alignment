@@ -29,6 +29,7 @@ def parse_args():
 	parser.add_argument('--span-extractor', type=str, choices=['mean_pool', 'max_pool', 'mean_max_pool', 'endpoint', 'diffsum', 'coherent'], help='which span extractor to use')
 	parser.add_argument('--decoding-method', type=str, required=True, choices=['greedy', 'intersection', 'weighted_intersection'], help='which method to use to decode alignments')
 	parser.add_argument('--allow-overlap', action='store_true', help='whether to allow spans in the alignments to overlap')
+	parser.add_argument('--model-layer', type=int, required=True, help='Which layer of the model to get representations from (0-indexed, supports negative indexing)')
 	parser.add_argument('--verbose', action='store_true', help='enable verbose logging')
 
 	args = parser.parse_args()
@@ -114,7 +115,7 @@ def _custom_sentencizer(doc):
 			doc[i].is_sent_start = False
 	return doc
 
-def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decoding_method, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, allow_overlap=False, verbose=False):
+def align(source_tokens, target_tokens, tokenizer, model, model_layer, span_extractor, decoding_method, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, allow_overlap=False, verbose=False):
 	if verbose:
 		print('='*20)
 		print(f"src: {source_tokens}")
@@ -178,8 +179,9 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decodi
 	table = np.zeros((num_source_spans, num_target_spans))
 
 	with torch.no_grad():
-		source_subtoken_embeddings = model(**encoded_source_sentence)['last_hidden_state']
-		target_subtoken_embeddings = model(**encoded_target_sentence)['last_hidden_state']
+		# TODO: encode source and target in the same sequence to allow attention flow between the sequences?
+		source_subtoken_embeddings = model(**encoded_source_sentence)['hidden_states'][model_layer]
+		target_subtoken_embeddings = model(**encoded_target_sentence)['hidden_states'][model_layer]
 		if type(span_extractor) == SelfAttentiveSpanExtractor:
 			source_span_embeddings = span_extractor._embed_spans(source_subtoken_embeddings, torch.tensor(source_subtoken_span_boundaries))[0]
 			target_span_embeddings = span_extractor._embed_spans(target_subtoken_embeddings, torch.tensor(target_subtoken_span_boundaries))[0]
@@ -193,6 +195,8 @@ def align(source_tokens, target_tokens, tokenizer, model, span_extractor, decodi
 		for i in range(num_source_spans):
 			for j in range(num_target_spans):
 				table[i][j] = torch.nn.functional.cosine_similarity(source_span_embeddings[i], target_span_embeddings[j], dim=0)
+
+	# TODO: use some sort of convolution like in https://aclanthology.org/D19-1084/ to encourage locally consistent/monotonic alignments?
 
 	# Decode alignments from table
 	if decoding_method == "greedy":
@@ -314,7 +318,7 @@ def main():
 			data.append(json.loads(line))
 
 	tokenizer = AutoTokenizer.from_pretrained('xlm-roberta-base')
-	model = AutoModel.from_pretrained('xlm-roberta-base')
+	model = AutoModel.from_pretrained('xlm-roberta-base', output_hidden_states=True)
 
 	if args.span_extractor == "mean_pool":
 		span_extractor = mean_pool
@@ -419,7 +423,7 @@ def main():
 		source_sentence, source_span_boundaries = _get_tokens_and_spans(item, lang=args.source_lang, side="source", spacy_parsers=SPACY_PARSERS)
 		target_sentence, target_span_boundaries = _get_tokens_and_spans(item, lang=args.target_lang, side="target", spacy_parsers=SPACY_PARSERS)
 
-		alignment = align(source_sentence, target_sentence, tokenizer, model, span_extractor, args.decoding_method, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, allow_overlap=args.allow_overlap, verbose=args.verbose)
+		alignment = align(source_sentence, target_sentence, tokenizer, model, args.model_layer, span_extractor, args.decoding_method, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, allow_overlap=args.allow_overlap, verbose=args.verbose)
 
 		outputs.append({"source_tokens": source_sentence, "target_tokens": target_sentence, "alignment": alignment})
 
