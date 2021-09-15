@@ -30,6 +30,7 @@ def parse_args():
 	parser.add_argument('--decoding-method', type=str, required=True, choices=['greedy', 'intersection', 'weighted_intersection'], help='which method to use to decode alignments')
 	parser.add_argument('--allow-overlap', action='store_true', help='whether to allow spans in the alignments to overlap')
 	parser.add_argument('--model-layer', type=int, required=True, help='Which layer of the model to get representations from (0-indexed, supports negative indexing)')
+	parser.add_argument('--couple', action='store_true', help='whether to couple the representations by encoding the sentences together (otherwise sentences are encoded separately)')
 	parser.add_argument('--verbose', action='store_true', help='enable verbose logging')
 
 	args = parser.parse_args()
@@ -115,18 +116,21 @@ def _custom_sentencizer(doc):
 			doc[i].is_sent_start = False
 	return doc
 
-def align(source_tokens, target_tokens, tokenizer, model, model_layer, span_extractor, decoding_method, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, allow_overlap=False, verbose=False):
+def align(source_tokens, target_tokens, tokenizer, model, model_layer, span_extractor, decoding_method, source_span_boundaries=None, target_span_boundaries=None, source_lang="en", target_lang="fr", max_source_span_width=None, max_target_span_width=None, allow_overlap=False, couple=False, verbose=False):
 	if verbose:
 		print('='*20)
 		print(f"src: {source_tokens}")
 		print(f"tgt: {target_tokens}")
 		print('-'*20)
 
-	encoded_source_sentence = tokenizer(source_tokens, padding=True, truncation=True, return_tensors='pt', is_split_into_words=True)
-	encoded_target_sentence = tokenizer(target_tokens, padding=True, truncation=True, return_tensors='pt', is_split_into_words=True)
+	if couple:
+		encoded_sentence_pair = tokenizer(source_tokens + [tokenizer.sep_token, tokenizer.cls_token] + target_tokens, padding=True, truncation=True, return_tensors='pt', is_split_into_words=True)
+	else:
+		encoded_source_sentence = tokenizer(source_tokens, padding=True, truncation=True, return_tensors='pt', is_split_into_words=True)
+		encoded_target_sentence = tokenizer(target_tokens, padding=True, truncation=True, return_tensors='pt', is_split_into_words=True)
 
-	source_subtoken_ids = encoded_source_sentence['input_ids'][0].tolist()
-	target_subtoken_ids = encoded_target_sentence['input_ids'][0].tolist()
+	# source_subtoken_ids = encoded_source_sentence['input_ids'][0].tolist()
+	# target_subtoken_ids = encoded_target_sentence['input_ids'][0].tolist()
 
 	source_token2subtoken = []
 	target_token2subtoken = []
@@ -179,9 +183,18 @@ def align(source_tokens, target_tokens, tokenizer, model, model_layer, span_extr
 	table = np.zeros((num_source_spans, num_target_spans))
 
 	with torch.no_grad():
-		# TODO: encode source and target in the same sequence to allow attention flow between the sequences?
-		source_subtoken_embeddings = model(**encoded_source_sentence)['hidden_states'][model_layer]
-		target_subtoken_embeddings = model(**encoded_target_sentence)['hidden_states'][model_layer]
+		if couple:
+			# encode source and target in the same sequence to allow attention flow between the sequences
+			num_source_subtokens = len([st for t in source_subtokens for st in t])
+			num_target_subtokens = len([st for t in target_subtokens for st in t])
+			coupled_subtoken_embeddings = model(**encoded_sentence_pair)['hidden_states'][model_layer]
+			assert coupled_subtoken_embeddings.shape[1] == num_source_subtokens + num_target_subtokens + 4  # account for [CLS] and [SEP] tokens surrounding the source and target sequences
+			source_subtoken_embeddings = coupled_subtoken_embeddings[:,:num_source_subtokens+2,:]  # account for [CLS] and [SEP] tokens surrounding the source sequence
+			target_subtoken_embeddings = coupled_subtoken_embeddings[:,num_source_subtokens+2:,:]
+		else:
+			source_subtoken_embeddings = model(**encoded_source_sentence)['hidden_states'][model_layer]
+			target_subtoken_embeddings = model(**encoded_target_sentence)['hidden_states'][model_layer]
+
 		if type(span_extractor) == SelfAttentiveSpanExtractor:
 			source_span_embeddings = span_extractor._embed_spans(source_subtoken_embeddings, torch.tensor(source_subtoken_span_boundaries))[0]
 			target_span_embeddings = span_extractor._embed_spans(target_subtoken_embeddings, torch.tensor(target_subtoken_span_boundaries))[0]
@@ -423,7 +436,7 @@ def main():
 		source_sentence, source_span_boundaries = _get_tokens_and_spans(item, lang=args.source_lang, side="source", spacy_parsers=SPACY_PARSERS)
 		target_sentence, target_span_boundaries = _get_tokens_and_spans(item, lang=args.target_lang, side="target", spacy_parsers=SPACY_PARSERS)
 
-		alignment = align(source_sentence, target_sentence, tokenizer, model, args.model_layer, span_extractor, args.decoding_method, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, allow_overlap=args.allow_overlap, verbose=args.verbose)
+		alignment = align(source_sentence, target_sentence, tokenizer, model, args.model_layer, span_extractor, args.decoding_method, source_span_boundaries, target_span_boundaries, max_source_span_width=args.max_source_span_width, max_target_span_width=args.max_target_span_width, allow_overlap=args.allow_overlap, couple=args.couple, verbose=args.verbose)
 
 		outputs.append({"source_tokens": source_sentence, "target_tokens": target_sentence, "alignment": alignment})
 
