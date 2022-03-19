@@ -7,7 +7,7 @@ import benepar, spacy
 from spacy.tokens import Doc
 from benepar import BeneparComponent
 
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoConfig
 
 from allennlp.modules.span_extractors import SelfAttentiveSpanExtractor, EndpointSpanExtractor, BidirectionalEndpointSpanExtractor
 
@@ -29,6 +29,7 @@ def parse_args():
 	parser.add_argument('--span-extractor', type=str, choices=['mean_pool', 'max_pool', 'mean_max_pool', 'endpoint', 'diffsum', 'coherent'], help='which span extractor to use')
 	parser.add_argument('--decoding-method', type=str, required=True, choices=['greedy', 'intersection', 'weighted_intersection'], help='which method to use to decode alignments')
 	parser.add_argument('--allow-overlap', action='store_true', help='whether to allow spans in the alignments to overlap')
+	parser.add_argument('--pretrained-encoder-name', type=str, default='microsoft/xlm-align-base', help='which pretrained encoder to use')
 	parser.add_argument('--model-layer', type=int, required=True, help='Which layer of the model to get representations from (0-indexed, supports negative indexing)')
 	parser.add_argument('--couple', action='store_true', help='whether to couple the representations by encoding the sentences together (otherwise sentences are encoded separately)')
 	parser.add_argument('--verbose', action='store_true', help='enable verbose logging')
@@ -95,12 +96,13 @@ def mean_max_pool(subtoken_embeddings, subtoken_span_boundaries):
 	return torch.cat([mean_pool(subtoken_embeddings, subtoken_span_boundaries), max_pool(subtoken_embeddings, subtoken_span_boundaries)], dim=1)
 
 def coherent(subtoken_embeddings, subtoken_span_boundaries):
-	endpoint_representation = EndpointSpanExtractor(768)._embed_spans(subtoken_embeddings, torch.as_tensor(subtoken_span_boundaries).unsqueeze(0))[0]
+	embedding_size = subtoken_embeddings.shape[-1]
+	endpoint_representation = EndpointSpanExtractor(embedding_size)._embed_spans(subtoken_embeddings, torch.as_tensor(subtoken_span_boundaries).unsqueeze(0))[0]
 	# Choice of `a` and `b` dimensionalities follows from the proportions described in footnote 2 of https://aclanthology.org/2020.repl4nlp-1.20/
-	a = 360
-	b = 24
-	left_endpoint = endpoint_representation[:, :768]
-	right_endpoint = endpoint_representation[:, 768:]
+	a = int((480/1024)*embedding_size)
+	b = int((embedding_size - (2*a)) / 2)
+	left_endpoint = endpoint_representation[:, :embedding_size]
+	right_endpoint = endpoint_representation[:, embedding_size:]
 	left_endpoint_pieces = left_endpoint[:, :a], left_endpoint[:, a:a*2], left_endpoint[:, a*2:a*2 + b], left_endpoint[:, a*2 + b:]
 	right_endpoint_pieces = right_endpoint[:, :a], right_endpoint[:, a:a*2], right_endpoint[:, a*2:a*2 + b], right_endpoint[:, a*2 + b:]
 	coherence_term = torch.sum(left_endpoint_pieces[2]*right_endpoint_pieces[3], dim=1).unsqueeze(-1)
@@ -207,12 +209,16 @@ def align(source_tokens, target_tokens, tokenizer, model, model_layer, span_extr
 
 		for i in range(num_source_spans):
 			for j in range(num_target_spans):
+				# TODO: factor into the table scores the span lengths or the difference in span lengths?
+				# TODO: do some sort of normalization, like compute F1 as in Eq. 1 of https://arxiv.org/pdf/1910.07475.pdf
 				table[i][j] = torch.nn.functional.cosine_similarity(source_span_embeddings[i], target_span_embeddings[j], dim=0)
 
 	# TODO: use some sort of convolution like in https://aclanthology.org/D19-1084/ to encourage locally consistent/monotonic alignments?
+	# TODO: use entropy-based null alignment like in https://aclanthology.org/2020.findings-emnlp.147.pdf
 
 	# Decode alignments from table
 	if decoding_method == "greedy":
+		# This algorithm is similar to the one used in 10.1109/ICMI.2002.1167002 (Huang and Vogel, 2002)
 		used_source_spans = []
 		used_target_spans = []
 		result = []
@@ -313,6 +319,12 @@ def align(source_tokens, target_tokens, tokenizer, model, model_layer, span_extr
 				used_target_spans.append(target_span)
 
 			table[best_alignment] = float('-inf')  # erase so we can move on to the next best alignment
+	elif decoding_method == "itermax":
+		# TODO: implement itermax algorithm from SimAlign: https://aclanthology.org/2020.findings-emnlp.147/
+		raise NotImplementedError
+	elif decoding_method == "optimal_transport":
+		# TODO: implement optimal transport as in Section 3.1 of https://arxiv.org/pdf/2106.06381.pdf
+		raise NotImplementedError
 	else:
 		raise ValueError(f"unrecognized decoding method: {decoding_method}")
 
@@ -330,8 +342,9 @@ def main():
 		for line in f:
 			data.append(json.loads(line))
 
-	tokenizer = AutoTokenizer.from_pretrained('xlm-roberta-base')
-	model = AutoModel.from_pretrained('xlm-roberta-base', output_hidden_states=True)
+	tokenizer = AutoTokenizer.from_pretrained(args.pretrained_encoder_name)
+	model = AutoModel.from_pretrained(args.pretrained_encoder_name, output_hidden_states=True)
+	embedding_size = AutoConfig.from_pretrained(args.pretrained_encoder_name).hidden_size
 
 	if args.span_extractor == "mean_pool":
 		span_extractor = mean_pool
@@ -340,10 +353,10 @@ def main():
 	elif args.span_extractor == "mean_max_pool":
 		span_extractor = mean_max_pool
 	elif args.span_extractor == "endpoint":
-		span_extractor = EndpointSpanExtractor(768)
+		span_extractor = EndpointSpanExtractor(embedding_size)
 	elif args.span_extractor == "diffsum":
 		# https://aclanthology.org/2020.repl4nlp-1.20/
-		span_extractor = EndpointSpanExtractor(768, combination="x+y,y-x")
+		span_extractor = EndpointSpanExtractor(embedding_size, combination="x+y,y-x")
 	elif args.span_extractor == "coherent":
 		# https://aclanthology.org/P19-1436/
 		span_extractor = coherent
@@ -387,7 +400,7 @@ def main():
 
 				if pretokenized:
 					nlp = spacy_parsers[lang]['pretokenized']['spacy_model']
-					ConstituencyParser = SPACY_PARSERS[lang]['pretokenized']['parser']
+					ConstituencyParser = spacy_parsers[lang]['pretokenized']['parser']
 					doc = Doc(nlp.vocab, words=tokens, spaces=[True]*(len(tokens)-1) + [False])
 					doc = _custom_sentencizer(doc)
 					doc = ConstituencyParser(doc)
@@ -422,11 +435,11 @@ def main():
 			spacy_model = spacy.load(spacy_model_name, disable=['tagger', 'parser', 'ner'])
 			parser = BeneparComponent(parser_model_name)
 
-			_untok_spacy_model = spacy.load(spacy_model_name, disable=['ner'])
-			_untok_spacy_model.add_pipe("benepar", config={"model": parser_model_name})
+			untok_spacy_model = spacy.load(spacy_model_name, disable=['ner'])
+			untok_spacy_model.add_pipe("benepar", config={"model": parser_model_name})
 
 			return {'pretokenized': {"spacy_model": spacy_model, "parser": parser},
-					'untokenized': {"spacy_model": _untok_spacy_model}}
+					'untokenized': {"spacy_model": untok_spacy_model}}
 
 		for lang in [args.source_lang, args.target_lang]:
 			SPACY_PARSERS[lang] = _instantiate_parser(SPACY_NAMES[lang]['spacy_model_name'], SPACY_NAMES[lang]['parser_name'])
