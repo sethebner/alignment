@@ -337,7 +337,7 @@ def align(source_tokens, target_tokens, tokenizer, model, model_layer, span_extr
 		# TODO: threshold probabilities like in AwesomeAlign?
 
 		# Symmetrize
-		table *= (probability_source_span_for_target_span * probability_target_span_for_source_span)
+		table = (probability_source_span_for_target_span * probability_target_span_for_source_span)
 
 		# The most amount of alignments to decode
 		# If we use the greedy decoding method here without a way to know when to stop, then we might end up decoding alignments we discarded previously
