@@ -27,7 +27,7 @@ def parse_args():
 	parser.add_argument('--max-target-span-width', type=int, default=None, help='maximum length of a target text span')
 	parser.add_argument('--span-enumeration', type=str, required=True, choices=['full', 'parse'], help='how to enumerate spans when not provided')
 	parser.add_argument('--span-extractor', type=str, choices=['mean_pool', 'max_pool', 'mean_max_pool', 'endpoint', 'diffsum', 'coherent'], help='which span extractor to use')
-	parser.add_argument('--decoding-method', type=str, required=True, choices=['greedy', 'intersection', 'weighted_intersection', 'weighted_symmetrized_softmax'], help='which method to use to decode alignments')
+	parser.add_argument('--decoding-method', type=str, required=True, choices=['greedy', 'intersection', 'weighted_intersection', 'weighted_symmetrized_softmax', 'softmax_threshold_intersection'], help='which method to use to decode alignments')
 	parser.add_argument('--allow-overlap', action='store_true', help='whether to allow spans in the alignments to overlap')
 	parser.add_argument('--pretrained-encoder-name', type=str, default='microsoft/xlm-align-base', help='which pretrained encoder to use')
 	parser.add_argument('--model-layer', type=int, required=True, help='Which layer of the model to get representations from (0-indexed, supports negative indexing)')
@@ -334,9 +334,52 @@ def align(source_tokens, target_tokens, tokenizer, model, model_layer, span_extr
 		probability_source_span_for_target_span = np.array(torch.nn.functional.softmax(torch.as_tensor(table), dim=0))
 		probability_target_span_for_source_span = np.array(torch.nn.functional.softmax(torch.as_tensor(table), dim=1))
 
-		# TODO: threshold probabilities like in AwesomeAlign?
+		# Symmetrize
+		table = (probability_source_span_for_target_span * probability_target_span_for_source_span)
+
+		# The most amount of alignments to decode
+		# If we use the greedy decoding method here without a way to know when to stop, then we might end up decoding alignments we discarded previously
+		max_alignments = len(np.argwhere(table).tolist())
+
+		# Decode in descending order of score
+		for _ in range(max_alignments):
+			best_alignment = np.unravel_index(table.argmax(), table.shape)
+			source_span_idx, target_span_idx = best_alignment
+			source_span = source_span_boundaries[source_span_idx]
+			target_span = target_span_boundaries[target_span_idx]
+
+			if allow_overlap or (not overlaps(source_span[0], source_span[1], used_source_spans) and not overlaps(target_span[0], target_span[1], used_target_spans)):
+				source_span_tokens = source_tokens[source_span[0]:source_span[1]+1]
+				target_span_tokens = target_tokens[target_span[0]:target_span[1]+1]
+
+				result.append({"source_span": source_span, "target_span": target_span, "source_span_tokens": source_span_tokens, "target_span_tokens": target_span_tokens, "score": table[best_alignment]})
+
+				if verbose:
+					print(source_span_tokens, target_span_tokens, source_span, target_span, table[best_alignment])
+
+				used_source_spans.append(source_span)
+				used_target_spans.append(target_span)
+
+			table[best_alignment] = float('-inf')  # erase so we can move on to the next best alignment
+	elif decoding_method == "softmax_threshold_intersection":
+		# Based on method used in AwesomeAlign: https://aclanthology.org/2021.eacl-main.181/
+		threshold = 1e-3  # value used in AwesomeAlign
+		used_source_spans = []
+		used_target_spans = []
+		result = []
+
+		# Normalize similarity scores using softmax like in AwesomeAlign: https://aclanthology.org/2021.eacl-main.181/
+		probability_source_span_for_target_span = np.array(torch.nn.functional.softmax(torch.as_tensor(table), dim=0))
+		probability_target_span_for_source_span = np.array(torch.nn.functional.softmax(torch.as_tensor(table), dim=1))
+
+		# Threshold
+		probability_source_span_for_target_span[probability_source_span_for_target_span < threshold] = 0
+		probability_target_span_for_source_span[probability_target_span_for_source_span < threshold] = 0
 
 		# Symmetrize
+		# We deviate from the approach in AwesomeAlign by constructing a scalar-valued table instead of a boolean-valued table
+		# since AwesomeAlign allows many-to-many alignments, but we do not. Retaining scalars allows us to differentiate between
+		# possible alignments and determine a suitable decoding order.
 		table = (probability_source_span_for_target_span * probability_target_span_for_source_span)
 
 		# The most amount of alignments to decode
